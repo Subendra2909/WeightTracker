@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -469,12 +469,509 @@ jobs:
           }
           EOF_FILE
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      - name: Prepare Android SDK
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WeightTracker-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WeightTracker"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.subendra.weighttracker"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.subendra.weighttracker"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(composeBom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Only needed to save into Downloads on Android 9 and below -->
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Weight Tracker"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/subendra/weighttracker
+          cat > app/src/main/java/com/subendra/weighttracker/Data.kt <<'EOF_FILE'
+          package com.subendra.weighttracker
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import java.io.File
+          import java.math.BigDecimal
+          import java.math.RoundingMode
+          import java.time.DayOfWeek
+          import java.time.LocalDate
+          import java.time.temporal.TemporalAdjusters
+
+          /** Weight is stored as integer hundredths of a kg (72.35 kg -> 7235) so there is never float error. */
+          data class Entry(val date: LocalDate, val hundredths: Int)
+
+          data class WeekSummary(
+              val weekStart: LocalDate,
+              val weekEnd: LocalDate,
+              val averageHundredths: BigDecimal, // average in hundredths, already rounded to 2 dp in kg terms
+              val count: Int,
+          )
+
+          fun formatKg(hundredths: Int): String =
+              BigDecimal(hundredths).movePointLeft(2).setScale(2).toPlainString()
+
+          fun formatKg(averageKg: BigDecimal): String = averageKg.setScale(2, RoundingMode.HALF_UP).toPlainString()
+
+          /** Parses "72.5" / "72.35" / "72" into hundredths. Returns null if invalid or out of range. */
+          fun parseKg(text: String): Int? {
+              val value = text.trim().toBigDecimalOrNull() ?: return null
+              if (value.scale() > 2) return null
+              val h = value.movePointRight(2).toInt()
+              return if (h in 1..70000) h else null
+          }
+
+          fun weekStartOf(date: LocalDate): LocalDate =
+              date.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+
+          /**
+           * Weekly average = mean of the weights actually logged in that Monday–Sunday week.
+           * Missing days are simply not counted, so 3 entries in a week -> sum / 3.
+           */
+          fun weeklyAverages(entries: List<Entry>): List<WeekSummary> =
+              entries.groupBy { weekStartOf(it.date) }
+                  .map { (start, list) ->
+                      val sum = list.sumOf { it.hundredths }
+                      val avgKg = BigDecimal(sum)
+                          .divide(BigDecimal(list.size * 100), 2, RoundingMode.HALF_UP)
+                      WeekSummary(start, start.plusDays(6), avgKg, list.size)
+                  }
+                  .sortedByDescending { it.weekStart }
+
+          class WeightStore(context: Context) {
+              private val prefs = context.getSharedPreferences("weights", Context.MODE_PRIVATE)
+
+              fun all(): List<Entry> =
+                  prefs.all.mapNotNull { (k, v) ->
+                      val date = runCatching { LocalDate.parse(k) }.getOrNull()
+                      val h = v as? Int
+                      if (date != null && h != null) Entry(date, h) else null
+                  }.sortedBy { it.date }
+
+              fun put(entry: Entry) {
+                  prefs.edit().putInt(entry.date.toString(), entry.hundredths).apply()
+              }
+
+              fun delete(date: LocalDate) {
+                  prefs.edit().remove(date.toString()).apply()
+              }
+          }
+
+          fun buildCsv(entries: List<Entry>): String {
+              val weekly = weeklyAverages(entries).associateBy { it.weekStart }
+              val sb = StringBuilder()
+              sb.append("Date,Weight (kg),Week Start (Mon),Week Average (kg),Entries In Week\n")
+              for (e in entries.sortedBy { it.date }) {
+                  val w = weekly[weekStartOf(e.date)]!!
+                  sb.append("${e.date},${formatKg(e.hundredths)},${w.weekStart},${formatKg(w.averageHundredths)},${w.count}\n")
+              }
+              return sb.toString()
+          }
+
+          /** Saves a CSV into the phone's public Downloads folder. Returns the file name on success. */
+          fun exportToDownloads(context: Context, entries: List<Entry>): String? {
+              val name = "WeightTracker_${LocalDate.now()}.csv"
+              val bytes = buildCsv(entries).toByteArray(Charsets.UTF_8)
+              return try {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, name)
+                          put(MediaStore.Downloads.MIME_TYPE, "text/csv")
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                      }
+                      val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                          ?: return null
+                      context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return null
+                  } else {
+                      val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                      dir.mkdirs()
+                      File(dir, name).writeBytes(bytes)
+                  }
+                  name
+              } catch (e: Exception) {
+                  null
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/subendra/weighttracker
+          cat > app/src/main/java/com/subendra/weighttracker/MainActivity.kt <<'EOF_FILE'
+          package com.subendra.weighttracker
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.DatePicker
+          import androidx.compose.material3.DatePickerDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SelectableDates
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.rememberDatePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.launch
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.ZoneOffset
+          import java.time.format.DateTimeFormatter
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val store = WeightStore(applicationContext)
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxWidth()) {
+                              TrackerScreen(store)
+                          }
+                      }
+                  }
+              }
+          }
+
+          private val dayFmt = DateTimeFormatter.ofPattern("dd MMM yyyy")
+          private val shortFmt = DateTimeFormatter.ofPattern("dd MMM")
+          private val weightRegex = Regex("^\\d{0,3}(\\.\\d{0,2})?$")
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun TrackerScreen(store: WeightStore) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val snackbar = remember { SnackbarHostState() }
+
+              var entries by remember { mutableStateOf(store.all()) }
+              var selectedDate by remember { mutableStateOf(LocalDate.now()) }
+              var weightText by remember { mutableStateOf("") }
+              var showPicker by remember { mutableStateOf(false) }
+
+              fun say(msg: String) = scope.launch { snackbar.showSnackbar(msg) }
+
+              fun doExport() {
+                  if (entries.isEmpty()) {
+                      say("Nothing to export yet")
+                      return
+                  }
+                  val name = exportToDownloads(context, entries)
+                  say(if (name != null) "Saved to Downloads/$name" else "Export failed")
+              }
+
+              // Android 9 and below need a runtime storage permission to write into Downloads
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted ->
+                  if (granted) doExport() else say("Storage permission is needed to export")
+              }
+
+              fun onExportClick() {
+                  val needsPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+                      ContextCompat.checkSelfPermission(
+                          context, Manifest.permission.WRITE_EXTERNAL_STORAGE
+                      ) != PackageManager.PERMISSION_GRANTED
+                  if (needsPermission) permissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                  else doExport()
+              }
+
+              fun onSave() {
+                  val h = parseKg(weightText)
+                  if (h == null) {
+                      say("Enter a weight in kg with up to 2 decimals, e.g. 72.35")
+                      return
+                  }
+                  val existed = entries.any { it.date == selectedDate }
+                  store.put(Entry(selectedDate, h))
+                  entries = store.all()
+                  weightText = ""
+                  say(if (existed) "Updated ${selectedDate.format(dayFmt)}" else "Saved ${selectedDate.format(dayFmt)}")
+              }
+
+              val weeks = weeklyAverages(entries)
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          title = { Text("Weight Tracker") },
+                          actions = { TextButton(onClick = { onExportClick() }) { Text("Export") } },
+                      )
+                  },
+                  snackbarHost = { SnackbarHost(snackbar) },
+              ) { padding ->
+                  LazyColumn(
+                      modifier = Modifier.padding(padding),
+                      contentPadding = PaddingValues(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(10.dp),
+                  ) {
+                      item {
+                          Card(Modifier.fillMaxWidth()) {
+                              Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                  OutlinedTextField(
+                                      value = weightText,
+                                      onValueChange = { if (weightRegex.matches(it)) weightText = it },
+                                      label = { Text("Weight (kg)") },
+                                      placeholder = { Text("72.35") },
+                                      singleLine = true,
+                                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                      modifier = Modifier.fillMaxWidth(),
+                                  )
+                                  OutlinedButton(onClick = { showPicker = true }, modifier = Modifier.fillMaxWidth()) {
+                                      Text("Date: ${selectedDate.format(dayFmt)}")
+                                  }
+                                  Button(onClick = { onSave() }, modifier = Modifier.fillMaxWidth()) {
+                                      Text("Save")
+                                  }
+                                  Text(
+                                      "Saving on a date that already has a weight replaces it.",
+                                      style = MaterialTheme.typography.bodySmall,
+                                  )
+                              }
+                          }
+                      }
+
+                      item { Text("Weekly average", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                      if (weeks.isEmpty()) {
+                          item { Text("Add your first weight to see weekly averages.") }
+                      }
+                      items(weeks, key = { it.weekStart.toString() }) { w ->
+                          Card(Modifier.fillMaxWidth()) {
+                              Row(
+                                  Modifier.padding(16.dp).fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween,
+                                  verticalAlignment = Alignment.CenterVertically,
+                              ) {
+                                  Column {
+                                      Text(
+                                          "${w.weekStart.format(shortFmt)} – ${w.weekEnd.format(dayFmt)}",
+                                          fontWeight = FontWeight.Medium,
+                                      )
+                                      Text(
+                                          "${w.count} ${if (w.count == 1) "entry" else "entries"}",
+                                          style = MaterialTheme.typography.bodySmall,
+                                      )
+                                  }
+                                  Text("${formatKg(w.averageHundredths)} kg", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                              }
+                          }
+                      }
+
+                      item { Text("All entries", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                      items(entries.sortedByDescending { it.date }, key = { it.date.toString() }) { e ->
+                          Row(
+                              Modifier.fillMaxWidth(),
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Text(e.date.format(dayFmt), Modifier.weight(1f))
+                              Text("${formatKg(e.hundredths)} kg", fontWeight = FontWeight.Medium)
+                              TextButton(onClick = {
+                                  store.delete(e.date)
+                                  entries = store.all()
+                              }) { Text("Delete") }
+                          }
+                      }
+                  }
+              }
+
+              if (showPicker) {
+                  val todayMillis = LocalDate.now().atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+                  val state = rememberDatePickerState(
+                      initialSelectedDateMillis = selectedDate.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli(),
+                      selectableDates = object : SelectableDates {
+                          override fun isSelectableDate(utcTimeMillis: Long) = utcTimeMillis <= todayMillis
+                      },
+                  )
+                  DatePickerDialog(
+                      onDismissRequest = { showPicker = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              state.selectedDateMillis?.let {
+                                  selectedDate = Instant.ofEpochMilli(it).atZone(ZoneOffset.UTC).toLocalDate()
+                              }
+                              showPicker = false
+                          }) { Text("OK") }
+                      },
+                      dismissButton = { TextButton(onClick = { showPicker = false }) { Text("Cancel") } },
+                  ) { DatePicker(state = state) }
+              }
+          }
+          EOF_FILE
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Prepare Android SDK
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
